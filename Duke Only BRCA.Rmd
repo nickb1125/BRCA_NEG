@@ -17,11 +17,14 @@ library(survival)
 library(glmnet)
 library(survminer)
 library(stringr)
+library(here)
+
+setwd(here())
 
 
 ## DUKE CLEAN
 
-DUKE <- readxl::read_xlsx('/Users/nickbachelder/Desktop/Duke Internship 2022/brca-negative-stud/Duke Newest.xlsx', sheet = 1, col_names = F)
+DUKE <- readxl::read_xlsx('Duke Newest.xlsx', sheet = 1, col_names = F)
 na_columns_duke <- as.vector(!(is.na(DUKE[1, ]) & is.na(DUKE[2, ]))) ## excel columns with all NA
 DUKE <- DUKE[,na_columns_duke]
 names_duke_first <- zoo(as.character(DUKE[1, ])) ## repeat excel column names in continued cells
@@ -294,7 +297,7 @@ non_BRCA_modeling_final
 
 
 ```{r}
-save.image("/Users/nickbachelder/Desktop/Duke Internship 2022/brca-negative-stud/all_data2.RData")
+save.image("all_data2.RData")
 ```
 
 

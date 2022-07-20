@@ -24,8 +24,11 @@ library(glmnet)
 library(survminer)
 library(kableExtra)
 library(stringr)
+library(here)
 
-load('/Users/nickbachelder/Desktop/Duke Internship 2022/brca-negative-stud/all_data2.RData')
+setwd(here())
+
+load('all_data2.RData')
 ```
 
 
