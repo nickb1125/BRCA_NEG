@@ -157,6 +157,7 @@ FINAL
 # note: I spent some time exploring duplicate value, and they represent appointments where the same breast was tested twice and the same results occured. I took the liberty of removing these. I did not remove two readings on the same date with DIFFERENT resutlts. For these, I will take average of tests.
 # Note; for duplicated tests, if a patient tested positive either time for any of the tests, she was counted as positive
 
+
 ```{r}
 BRCA_pos <- FINAL %>% group_by(ids) %>% filter((min(BRCA_Mut) %in% c(1, 2))) %>% dplyr::select(ids, BRCA_Mut) %>% unique()
 
