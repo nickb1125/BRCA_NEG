@@ -1,0 +1,309 @@
+---
+title: "Untitled"
+author: "Nick R. Bachelder"
+date: "6/2/2022"
+output: html_document
+---
+
+```{r, message = F, warning = F, echo = F}
+knitr::opts_chunk$set(echo = TRUE)
+library(readxl)
+library(zoo)
+library(dplyr)
+library(tidyr)
+library(openxlsx)
+library(ggplot2)
+library(survival)
+library(glmnet)
+library(survminer)
+library(stringr)
+
+
+## DUKE CLEAN
+
+DUKE <- readxl::read_xlsx('/Users/nickbachelder/Desktop/Duke Internship 2022/brca-negative-stud/Duke Newest.xlsx', sheet = 1, col_names = F)
+na_columns_duke <- as.vector(!(is.na(DUKE[1, ]) & is.na(DUKE[2, ]))) ## excel columns with all NA
+DUKE <- DUKE[,na_columns_duke]
+names_duke_first <- zoo(as.character(DUKE[1, ])) ## repeat excel column names in continued cells
+names_duke_first <- na.locf(names_duke_first, na.rm = F)
+DUKE[1, ] <- matrix(names_duke_first, nrow = 1, ncol = length(names_duke_first), byrow = TRUE)
+names(DUKE) <- paste(DUKE[1, ], ifelse(is.na(DUKE[2, ]), '', DUKE[2, ]), sep = "_")
+names(DUKE) <- gsub(" ", "_", names(DUKE))
+DUKE <- DUKE[-c(1,2),] 
+DUKE[,'DU#_'] <- as.integer(unlist(DUKE[,'DU#_']) )
+DUKE <- DUKE %>% mutate('DU#_' = as.character(na.locf(zoo(DUKE$'DU#_')))) # repeat DU# for all rows of patient
+DUKE <- DUKE[!is.na(DUKE[,'DU-#_']),]
+
+DUKE <- DUKE %>% dplyr::rename('DU' = 'DU-#_', 'ids' = 'DU#_', 'Breast' = 'Breast_', 'ProphMDt' = 'Date_Proph_mast', 'CaDxDt' = 'Breast_Cancer_after_RPFNA_Date',
+                       'ER' = 'Breast_Cancer_after_RPFNA_ER','PR' = 'Breast_Cancer_after_RPFNA_PR', 'HER' = 'Breast_Cancer_after_RPFNA_HER',
+                       'BreastID' = 'Breast_Cancer_after_RPFNA_Breast', 'Cancer_Type' = 'Breast_Cancer_after_RPFNA_Stage', 'Atypia' = 'atypia_RPFNA',
+                       'Masood' = 'cytology_Masood', 'Cell_Count' = 'cytology_Cell_Count', 'Prev' = 'prev_', 'BMI' = 'BMI_', 'Meno' = 'clinical_characteristics_Meno',
+                       'Gail' = 'clinical_characteristics_Gail', 'Race' = 'clinical_characteristics_Race', 'DOB' = 'DOB_', 
+                       'Br_Cancer_Hx' = 'Breast_Cancer_Hx', 'BRCA_Mut' = 'Mutation_BRCA', 'FhxBrCA' = 'Fhx_BrCA', 'FHxPreBrCa' = 'Fhx_PreBrCA', 'FHxOther' = 'Fhx_Other', 
+                       'FxHxTotal' = 'Fhx_total', 'HRTc' = 'HRT_current', 'HRTever' = 'HRT_yrs_ever', 'Date_Previous_Breast' = 'Breast_Cancer_Prior_to_RPFNA_Date',
+                       'Date_of_Death' = 'Date_of_death_', 'Cause_Death'= 'Cause_of_death_', 'Last_Clinic_Visit' = 'Last_Duke_breast_clinic_visit_') %>% 
+  mutate(Instit = 'Duke', ids = paste(ids, '_D', sep = ''), visit_id = paste(gsub("([0-9.]+).*$", "\\1", DU), '_D', sep ='')) 
+
+DUKE %>% dplyr::select(ids, CaDxDt) %>% filter(!(is.na(CaDxDt))) %>% unique() %>% group_by(ids) %>% summarize(num_diag = n()) %>% filter(num_diag > 1) # patients with more than one diagenosis
+
+DUKE <- DUKE %>% 
+  group_by(ids) %>%
+  mutate(across(c(DOB, Race, CaDxDt, BreastID, Date_Previous_Breast, Date_of_Death, Last_Clinic_Visit), function(x){ifelse(any(!(is.na(x))), min(x, na.rm = T), NA)})) %>%
+  ungroup() %>% group_by(visit_id) %>% 
+  mutate(Date_RPFH = ifelse(any(!(is.na(Date_RPFH))), min(Date_RPFH, na.rm = T), NA), BMI = ifelse(any(!(is.na(BMI))), min(BMI, na.rm = T), NA)) %>% ungroup() %>%
+  dplyr::select(c(Instit, ids, visit_id, DU, Breast, DOB, Date_Previous_Breast,  Date_RPFH, ProphMDt, CaDxDt, ER, PR, HER, 
+                  BreastID, Cancer_Type, Atypia, Masood, Cell_Count, Prev, BMI, Meno, Gail, Race, Br_Cancer_Hx, BRCA_Mut, FhxBrCA, 
+                  FHxPreBrCa, FHxOther, FxHxTotal, HRTc, HRTever, Date_of_Death, Cause_Death, Last_Clinic_Visit)) %>% 
+  mutate(across(c('DOB', 'Date_RPFH', 'ProphMDt', 'CaDxDt', 'Date_Previous_Breast', 'Date_of_Death', 'Last_Clinic_Visit'), function(x) {convertToDate(as.character(x))})) 
+
+DUKE
+```
+
+
+
+## Add features for time since study start, time to diag, and age over the study
+## also need to filter out visits that occur AFTER diagnosis (n = 126 appointments)
+## There are a remaining 39 events (diagnosis)
+
+```{r, warning = F}
+fill_rows_min <- function(x){ifelse(any(!(is.na(x))), min(x, na.rm = T), NA)}
+fill_rows_max <- function(x){ifelse(any(!(is.na(x))), max(x, na.rm = T), NA)}
+fill_rows_mean <- function(x){ifelse(any(!(is.na(x))), mean(x, na.rm = T), NA)}
+
+### create function to calculate time to first diagnosis from list of study dates (start), diagnosis dates (diag), and death date (death) for each patient
+### also create funciton to calculate exact age of first appointment
+
+time_to_diag <- function(start, diag) {
+  if (all(is.na(diag))) { 
+    ret <- NA
+    return(ret)
+  }
+  else {
+    ret <- round(as.numeric(difftime(min(diag, na.rm = T), min(start), units = "weeks")/52.25), 2)
+    return(ret)
+  }
+}
+
+calculate_age <- function(dob, date) {
+  ret <- round(as.numeric(difftime(date, min(dob), units = "weeks")/52.25), 2)
+  return(ret)
+}
+  
+  
+## group by unique patient and use functions defined above to calculate time to diagnosis and age variables.
+
+n_app_before_any_filter <- length(unique(DUKE$visit_id))
+n_pat_before_any_filter <- length(unique(DUKE$ids))
+
+missing_Date <- DUKE %>% filter(is.na(Date_RPFH)) %>% dplyr::select(ids, visit_id, Date_RPFH) %>% unique() %>% mutate(Date_RPFH = 'Missing')
+FINAL <- DUKE %>% filter(!is.na(Date_RPFH))
+
+n_app_missing_Date <- n_app_before_any_filter - length(unique(FINAL$visit_id))
+n_pat_missing_Date <- n_pat_before_any_filter - length(unique(FINAL$ids))
+n_remaining_app <- length(unique(FINAL$visit_id))
+n_remaining_pat <- length(unique(FINAL$ids))
+
+missing_DOB <- FINAL %>% filter(is.na(DOB)) %>% dplyr::select(ids, DOB) %>% unique() %>% mutate(DOB = 'Missing')
+FINAL <- FINAL %>% filter(!is.na(DOB)) 
+
+n_app_missing_DOB <- n_remaining_app - length(unique(FINAL$visit_id))
+n_pat_missing_DOB <- n_remaining_pat - length(unique(FINAL$ids))
+n_remaining_app <- length(unique(FINAL$visit_id))
+n_remaining_pat <- length(unique(FINAL$ids))
+
+FINAL <- FINAL %>% group_by(ids)  %>%
+  mutate(Diagnosed = ifelse(is.na(CaDxDt), 0, 1), 
+                                           Time_to_Cancer_Diag = time_to_diag(start = Date_RPFH, diag = CaDxDt),
+                                           Age = calculate_age(dob = DOB, date = Date_RPFH),
+                                           Time_Since_Start = round(as.numeric(difftime(Date_RPFH, min(Date_RPFH, na.rm = T), units = "weeks")/52.25), 2)) %>%
+  mutate(Time_to_Cancer_Diag = ifelse(is.na(Time_to_Cancer_Diag), Inf, Time_to_Cancer_Diag)) %>%
+  mutate(Time_to_Cencor_Date = round(as.numeric(difftime(max(Last_Clinic_Visit), min(Date_RPFH), units = 'weeks'))/52.25, 2)) %>% ungroup() %>%
+  mutate(across(c('Breast', 'ER', 'PR', 'HER', 'BreastID', 'Cancer_Type', 'Atypia', 'Masood', 'Cell_Count', 'Prev', 'BMI', 'Meno', 'Gail', 'Race', 'Br_Cancer_Hx', 'BRCA_Mut',
+                  'FhxBrCA', 'FHxPreBrCa', 'FHxOther', 'FxHxTotal', 'HRTc', 'HRTever', 'Diagnosed', 'Time_to_Cancer_Diag', 'Age'), as.numeric)) %>%
+  rename('Breast_Diag_ID' = 'BreastID') 
+
+after_diag <- FINAL %>% dplyr::select(ids, visit_id, Time_to_Cancer_Diag, Time_Since_Start) %>% unique() %>% group_by(ids) %>% 
+  summarise(RPFH_after_Diag = sum(Time_to_Cancer_Diag - Time_Since_Start < 0), Total_RPFH = n()) %>% ungroup() %>% filter(RPFH_after_Diag  > 0) %>% 
+  mutate(Remove_Patient = ifelse(RPFH_after_Diag == Total_RPFH, 'Yes', 'No'))
+
+FINAL <- FINAL %>% filter(Time_to_Cancer_Diag - Time_Since_Start > 0)
+
+rm_app_issue_last <- n_remaining_app - length(unique(FINAL$visit_id))
+rm_pat_issue_last <- n_remaining_pat - length(unique(FINAL$ids))
+n_remaining_app <- length(unique(FINAL$visit_id))
+n_remaining_pat <- length(unique(FINAL$ids))
+
+FINAL <- FINAL %>% group_by(ids) %>% mutate(Age_at_Cencor_Date = min(Age), Age_at_Cancer_Diag = min(Age) + Time_to_Cancer_Diag) %>% ungroup()
+
+### instances of clinic last visit before last RPFNA date
+
+issues_last <- FINAL %>% filter(Date_RPFH > Last_Clinic_Visit) %>% dplyr::select(ids, visit_id, Date_RPFH, Last_Clinic_Visit) %>% unique()
+FINAL <- FINAL %>% filter(Date_RPFH < Last_Clinic_Visit)
+
+rm_app_after_diag <- n_remaining_app - length(unique(FINAL$visit_id))
+rm_pat_after_diag <- n_remaining_pat - length(unique(FINAL$ids))
+n_remaining_app <- length(unique(FINAL$visit_id))
+n_remaining_pat <- length(unique(FINAL$ids))
+
+
+## ADD THIS TO FINAL TO DEMONSTRATE TIME BTWN APPTMENT BIAS:::: %>% filter(CaDxDt < max(Date_RPFH) | is.na(CaDxDt))
+## write.xlsx(FINAL, 'time_to_diag.xlsx', sheetName = "Sheet1", col.names = TRUE, row.names = TRUE, append = FALSE)
+
+FINAL
+```
+
+
+### Now, to do cox model, we want to have only one observation per patient visit, and only patients with no BRCA mutation
+# note: I spent some time exploring duplicate value, and they represent appointments where the same breast was tested twice and the same results occured. I took the liberty of removing these. I did not remove two readings on the same date with DIFFERENT resutlts. For these, I will take average of tests.
+# Note; for duplicated tests, if a patient tested positive either time for any of the tests, she was counted as positive
+
+```{r}
+BRCA_pos <- FINAL %>% group_by(ids) %>% filter((min(BRCA_Mut) %in% c(1, 2))) %>% dplyr::select(ids, BRCA_Mut) %>% unique()
+
+non_BRCA <- FINAL %>% group_by(ids) %>% filter(!(min(BRCA_Mut) %in% c(1, 2))) %>% ungroup() %>% 
+  mutate(Breast_Side = gsub('[0-9.]+', '', DU)) %>% 
+  dplyr::select(Instit, ids, visit_id, Time_Since_Start, Date_RPFH, Race, Age, BMI, Breast_Side, Atypia, Masood, Cell_Count, Breast_Diag_ID, Time_to_Cancer_Diag, Diagnosed, Time_to_Cencor_Date, Age_at_Cencor_Date, Age_at_Cancer_Diag, CaDxDt) %>% 
+  group_by(visit_id, Breast_Side) %>% 
+  mutate(Atypia = fill_rows_max(Atypia), BMI = fill_rows_mean(BMI), Masood = fill_rows_mean(Masood), Cell_Count = fill_rows_mean(Cell_Count)) %>% ungroup() %>% unique() 
+
+n_app_BRCA <- n_remaining_app - length(unique(non_BRCA$visit_id))
+n_pat_BRCA <- n_remaining_pat - length(unique(non_BRCA$ids))
+n_remaining_app <- length(unique(non_BRCA$visit_id))
+n_remaining_pat <- length(unique(non_BRCA$ids))
+
+visit_order <- unique(non_BRCA$visit_id)
+
+nrow(non_BRCA %>% group_by(visit_id, Breast_Side) %>% filter(n()>1) ) ## number of duplicated rows visit_ids on single breast = 0
+
+
+non_BRCA_L <- non_BRCA %>% filter(Breast_Side == 'L') %>% rename('Atypia_L' = 'Atypia', 'Masood_L' = 'Masood', 'Cell_Count_L' = 'Cell_Count') %>%
+  dplyr::select(-c(Breast_Side))
+non_BRCA_R <- non_BRCA %>% filter(Breast_Side == 'R') %>% rename('Atypia_R' = 'Atypia', 'Masood_R' = 'Masood', 'Cell_Count_R' = 'Cell_Count') %>%
+  dplyr::select(-c(Breast_Side))
+
+non_BRCA <- merge(non_BRCA_L, non_BRCA_R, by = c('Instit', 'visit_id','ids', 'Time_Since_Start', 'Race', 'Age', 'BMI', 'Breast_Diag_ID', 
+                                                 'Time_to_Cancer_Diag', 'Diagnosed', 'Time_to_Cencor_Date', 'Date_RPFH', 'Age_at_Cancer_Diag',
+                                                 'Age_at_Cencor_Date', 'CaDxDt'), all = T)  %>% 
+  mutate(Breast_Diag_ID = ifelse(Breast_Diag_ID == 0, 'L', 'R'))
+
+non_BRCA <- non_BRCA[match(visit_order, non_BRCA$visit_id),] ## fix order to original appointment order
+
+nrow(non_BRCA %>% group_by(visit_id) %>% filter(n()>1) ) ## number of duplicated rows visit_ids now that we have joined all visit dates (both tests for L, R in one row) = 0
+
+non_BRCA 
+```
+
+
+
+
+```{r}
+mean((non_BRCA %>% dplyr::select(ids, Diagnosed) %>% unique())$Diagnosed)
+
+non_BRCA %>% dplyr::select(ids, Instit, CaDxDt) %>% unique() %>% ggplot(aes(x = CaDxDt, group = Instit, fill = Instit)) + geom_histogram() + 
+  ggtitle('Diagnosis Dates OSE v Duke')
+
+non_BRCA %>% dplyr::select(ids, Instit, CaDxDt) %>% unique() %>% group_by(CaDxDt) %>% summarize(n = n())
+```
+
+
+
+```{r}
+diagnosed_times <- non_BRCA %>% dplyr::select(ids, Time_to_Cancer_Diag) %>% unique()
+ggplot(diagnosed_times, aes(x=Time_to_Cancer_Diag)) + 
+  geom_histogram(color="black", fill="white", bins = 10) + xlab('Time to Cancer Diagnosis In Years') + ylab('Patient Frequency') + ggtitle('Time to Cancer Diagnosis for Both Sites')
+```
+
+
+### NOTE: 4 appointments (likely error entries) had to be removed as they had dates that were before the previous appointment
+
+### There is 1 patient that was diagnosed but without a record of whether the cancer was in the L or R breast. Check for fix? (18_D)
+
+## ALSO: For those patients that were never diagnosed, we need to add a final period of time, which shows that they were monitored from last visit to censor date (12/31/19) and were not diagnosed
+
+## change variable for Diagnosed to only be 1 at the period of time which the patient was first diagnosed
+
+### Finally, we created a variable to represent Atyphia in EITHER BREAST, one for HIGHEST CELL COUNT, as well as one for HIGHEST MASOOD RATING
+
+```{r}
+non_BRCA_modeling_draft <- non_BRCA %>% rowwise() %>%
+  mutate(Atypia_Either = ifelse(any(!(is.na(c(Atypia_L, Atypia_R)))), max(c(Atypia_L, Atypia_R), na.rm = T), NA), 
+         Highest_Cell_Count = ifelse(any(!(is.na(c(Cell_Count_L, Cell_Count_R)))), max(c(Cell_Count_L, Cell_Count_R), na.rm = T), NA),
+         Highest_Masood = ifelse(any(!(is.na(c(Masood_L, Masood_R)))), max(c(Masood_L, Masood_R), na.rm = T), NA)) %>% group_by(ids) %>%
+  mutate(Start= Time_Since_Start, 
+         Stop = dplyr::lead(Start, default= ifelse(Diagnosed[1] == 0, Time_to_Cencor_Date[1],  Time_to_Cancer_Diag[1]))) %>% 
+  ### set diagnosed to be only in last period of diagnosed patient tracking
+  ungroup() %>% mutate(Diagnosed = ifelse(Time_to_Cancer_Diag == Stop, 1, 0))  %>% group_by(ids) %>%
+  mutate(Start_Age = min(Age) + Start, Stop_Age = min(Age) + Stop) %>% ungroup()
+
+
+### appointment time issue
+
+issue <- non_BRCA_modeling_draft  %>% filter(Start > Stop) %>% mutate(suppl = str_sub(ids, start= -2), visit_num = as.numeric(gsub("([0-9.]+).*$", "\\1", visit_id)),
+                                         next_id = ifelse(round(visit_num %% 1, 2) == 0.1, NA, visit_num + 0.1),
+                                         next_id = paste(next_id, suppl, sep = '')) %>% 
+  dplyr::select(ids, visit_id, Start, Stop, Start_Age, Stop_Age, Time_Since_Start,  Date_RPFH, next_id, Time_to_Cancer_Diag, Time_to_Cencor_Date) 
+
+prev <- non_BRCA_modeling_draft %>% filter(visit_id %in% issue$next_id) %>% dplyr::select(visit_id, Date_RPFH) %>% dplyr::rename('next_id' = 'visit_id', 'Next_RPFH' = 'Date_RPFH')
+
+time_issue <- merge(issue, prev, by = 'next_id', all = T) %>% dplyr::select(ids, visit_id, next_id, Date_RPFH, Next_RPFH)
+
+non_BRCA_modeling <- non_BRCA_modeling_draft %>% filter(Start < Stop) 
+
+app_rm_time <- n_remaining_app - length(unique(non_BRCA_modeling$visit_id))
+pat_rm_time <- n_remaining_pat - length(unique(non_BRCA_modeling$ids))
+n_remaining_app <- length(unique(non_BRCA_modeling$visit_id))
+n_remaining_pat <- length(unique(non_BRCA_modeling$ids))
+
+
+### idea: add variabels for CHANGE in variable since first appointment to see if change is significant in time sensitive covariates
+
+## These are number of patients removed for being a race that has under 2 sample size (Hispanic) or unknown
+ 
+non_BRCA_modeling %>% filter(Race %in% c(2, 3)) %>% dplyr::select(Instit, ids, Race) %>% unique()
+
+###
+
+non_BRCA_modeling <- non_BRCA_modeling %>% group_by(ids) %>% 
+  mutate(Highest_Cell_Count_Change = Highest_Cell_Count - Highest_Cell_Count[Time_Since_Start==0],
+         Highest_Masood_Change = Highest_Masood - Highest_Masood[Time_Since_Start==0]) %>% 
+  mutate(Duration_Btwn_Appt = Stop - Start) %>%
+  ungroup() %>%
+  filter(!(Race %in% c(2, 3))) %>%
+  mutate(Atypia_Either = as.factor(Atypia_Either), Race = as.factor(Race))  %>%
+  mutate(Race = recode_factor(Race, '0' = "White", "1" = 'AfricanAmerican'))
+
+non_BRCA_modeling_final <- non_BRCA_modeling %>% 
+  dplyr::select(Instit, ids, visit_id, Date_RPFH, Start, Stop, Start_Age, Stop_Age, Time_Since_Start, Race, BMI, Atypia_Either, Highest_Cell_Count, Highest_Masood, 
+         Highest_Masood_Change, Diagnosed, Duration_Btwn_Appt)
+
+
+non_BRCA_modeling_final <- non_BRCA_modeling_final[rowSums(is.na(non_BRCA_modeling_final)) == 0,]
+
+completeness_rm_app <- n_remaining_app - length(unique(non_BRCA_modeling_final$visit_id))
+completeness_rm_pat <- n_remaining_pat - length(unique(non_BRCA_modeling_final$ids))
+n_remaining_app <- length(unique(non_BRCA_modeling_final$visit_id))
+n_remaining_pat <- length(unique(non_BRCA_modeling_final$ids))
+
+num_final_app <- n_remaining_app
+num_final_pat <- n_remaining_pat
+
+non_BRCA_modeling_final
+```
+
+
+
+```{r}
+save.image("/Users/nickbachelder/Desktop/Duke Internship 2022/brca-negative-stud/all_data2.RData")
+```
+
+
+
+
+
+
+
+
+
+
+
+

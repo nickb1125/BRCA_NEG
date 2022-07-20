@@ -1,0 +1,236 @@
+---
+title: "Non-BRCA-Study-Info"
+author: "Nick R. Bachelder"
+date: "4/21/2022"
+output: html_document
+---
+
+
+
+```{r setup, include=FALSE}
+## Run BRCA study before running this script to get proper global environment
+
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+library(readxl)
+library(zoo)
+library(dplyr)
+library(tidyr)
+library(openxlsx)
+library(ggplot2)
+library(survival)
+library(glmnet)
+library(survminer)
+library(kableExtra)
+library(stringr)
+
+load('/Users/nickbachelder/Desktop/Duke Internship 2022/brca-negative-stud/all_data2.RData')
+```
+
+
+
+### Data summary
+
+```{r}
+column <- c('Unique Visits for Needle Asperation', 'Unique Patients in Study')
+attributes <- c('Number in Original Study', 'Number in Final Sample', 'Removed for missing DOB', 'Removed for missing appointment date',
+                'Removed for BRCA positive',
+                'Removed for having diagnosis before appointments', 'Removed for last clinic date before RPFNA Date', 'Removed for incorrect appointment date', 
+                'Removed for incompleteness of covariates', 'Patients Lost from Original Study')
+numbers_app <- c(n_app_before_any_filter, num_final_app, n_app_missing_DOB, n_app_missing_Date, n_app_BRCA, rm_app_after_diag, rm_app_issue_last, app_rm_time, completeness_rm_app,
+                 n_app_before_any_filter - num_final_app)
+numbers_pat <- c(n_pat_before_any_filter, num_final_pat, n_pat_missing_DOB, n_pat_missing_Date, n_pat_BRCA, rm_pat_after_diag, rm_pat_issue_last,  pat_rm_time, completeness_rm_pat,
+                 n_pat_before_any_filter - num_final_pat)
+x <- data.frame(numbers_app, numbers_pat) %>% `colnames<-`(column) %>% `rownames<-`(attributes) %>% kbl() %>% kable_classic() 
+
+kableExtra::row_spec(x, c(2, 8), extra_css = "border-bottom: 1px solid")
+```
+
+### Missing patient needle asperation data by appointment
+
+```{r}
+missing_Date %>% kbl() %>% kable_classic() 
+```
+
+### Missing patient date of birth
+
+```{r}
+missing_DOB %>% kbl() %>% kable_classic() 
+```
+
+
+### Patients with appointments after diagnosis
+
+```{r, echo=FALSE, warning = FALSE}
+after_diag %>% kbl() %>% kable_classic() 
+```
+
+### Patients with RPFNA appointments after supposed last clinic visit
+
+```{r, echo=FALSE, warning = FALSE}
+issues_last %>% kbl() %>% kable_classic() 
+```
+
+
+### Patients with appointment time issues
+```{r}
+time_issue %>% kbl() %>% kable_classic() 
+```
+
+
+### Patients that were BRCA positive
+```{r}
+BRCA_pos %>% kbl() %>% kable_classic() 
+```
+
+
+
+
+### Final data sample
+```{r}
+non_BRCA_modeling_final[1:20,]  %>% kbl() %>% kable_classic() 
+```
+
+
+
+
+## Covariance of variables
+
+```{r}
+library(corrplot)
+df <- non_BRCA_modeling_final %>% dplyr::select(Start_Age, BMI, Highest_Masood, Duration_Btwn_Appt, Atypia_Either) %>% mutate(Atypia_Either = as.numeric(Atypia_Either))
+cor.table = cor(df)
+corrplot(cor.table, method = 'color', order = 'AOE', tl.col = 'black', type = 'lower')
+```
+
+### Model with only atypia
+
+```{r}
+res.cox <- coxph(Surv(time = Start_Age, time2 = Stop_Age, Diagnosed)  ~ Atypia_Either +  cluster(ids), data = non_BRCA_modeling_final)
+summary(res.cox)
+
+
+new_df <- with(non_BRCA_modeling_final,
+               data.frame(ids = c('1', '1'),
+                          Atypia_Either = as.factor(c(0, 1)),
+                          Duration_Btwn_Appt = rep(mean(Duration_Btwn_Appt, na.rm = T), 2)
+                          )
+               )
+ggsurvplot(survfit(res.cox, newdata = new_df, data = non_BRCA_modeling_final), conf.int = TRUE, legend.labs=c("Atypia_Either=0", "Atypia_Either=1"),
+           ggtheme = theme_minimal())
+```
+
+### Model with only Race
+
+0: WHite
+1: AA
+2: Hispanic
+3: Missing / NA
+
+
+# Distribution of RPFNA by School
+```{r}
+non_BRCA_modeling_final %>% ggplot(aes(x = Date_RPFH, group = Instit, fill = Instit)) + geom_density(alpha = 0.5) + 
+  ggtitle('RPFNA Dates OSE v Duke')
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+res.cox <- coxph(Surv(time = Start_Age, time2 = Stop_Age, Diagnosed)  ~  Race +  cluster(ids), data = non_BRCA_modeling_final)
+summary(res.cox)
+
+new_df <- with(non_BRCA_modeling_final,
+               data.frame(ids = c('1', '51'),
+                          Race = rep(as.factor(c('White','AfricanAmerican')))
+                          )
+               )
+ggsurvplot(survfit(res.cox, newdata = new_df, data = non_BRCA_modeling_final), conf.int = TRUE, legend.labs=c('Race=White', "Race=AA"),
+           ggtheme = theme_minimal())
+```
+
+
+### Model with race and atypia
+
+
+```{r}
+res.cox <- coxph(Surv(time = Start_Age, time2 = Stop_Age, Diagnosed)  ~ Atypia_Either + Race +  cluster(ids), data = non_BRCA_modeling_final)
+summary(res.cox)
+
+non_BRCA_modeling_final %>% filter(Instit != 'Duke', Diagnosed == 1)
+```
+
+
+### Model with a few of the other continuous variables. NOTE: Highest_Masood significant when not included with Atypia, which it is correlated with.
+
+```{r}
+res.cox <- coxph(Surv(time = Start_Age, time2 = Stop_Age, Diagnosed)  ~  Highest_Masood + cluster(ids), data = non_BRCA_modeling_final)
+summary(res.cox)
+```
+
+
+```{r}
+res.cox <- coxph(Surv(time = Start_Age, time2 = Stop_Age, Diagnosed)  ~  Atypia_Either + Highest_Masood + BMI, data = non_BRCA_modeling_final)
+summary(res.cox)
+```
+
+
+
+
+
+
+
+
+
+
+
